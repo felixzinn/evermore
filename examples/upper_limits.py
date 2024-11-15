@@ -4,11 +4,52 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
+import matplotlib.pyplot as plt
 import optax
 from jaxtyping import Array
-from model import hists, model, observation
 
+# from model import hists, model, observation
 import evermore as evm
+
+
+class PyHFExample(eqx.Module):
+    mu: evm.Parameter
+    bkg_unc: evm.NormalParameter
+
+    def __init__(self) -> None:
+        evm.util.dataclass_auto_init(self)
+
+    def __call__(self, hists: dict):
+        expectations = {}
+        # signal process
+        sig_mod = self.mu.scale()
+        expectations["signal"] = sig_mod(hists["nominal"]["signal"])
+
+        # bkg process
+        bkg_mod = self.bkg_unc.morphing(
+            up_template=hists["shape_up"]["bkg"],
+            down_template=hists["shape_down"]["bkg"],
+        )
+        expectations["bkg"] = bkg_mod(hists["nominal"]["bkg"])
+
+        return expectations
+
+
+model = PyHFExample()
+hists = {
+    "nominal": {
+        "signal": jnp.array([10.0]),
+        "bkg": jnp.array([50.0]),
+    },
+    "shape_up": {
+        "bkg": jnp.array([57.0]),
+    },
+    "shape_down": {
+        "bkg": jnp.array([43.0]),
+    },
+}
+observation = jnp.array([55.0])
+
 
 # optimizer
 optim = optax.sgd(learning_rate=1e-2)
@@ -119,9 +160,35 @@ mu = 0.0
 qmu = jnp.where(mu_hat <= mu, likelihood_ratio_value, 0.0)
 pmu = 1 - jsp.stats.norm.cdf(jnp.sqrt(qmu))
 
-mu_vals = jnp.arange(0, 10, 0.5)
+# CL_s+b
+mu_vals = jnp.arange(0, 5, 0.2)
 pmu_vals = []
 for mu in mu_vals:
     lr_val, mu_hat = likelihood_ratio(mu)
     qmu = jnp.where(mu_hat <= mu, lr_val, 0.0)
     pmu_vals.append(1 - jsp.stats.norm.cdf(jnp.sqrt(qmu)))
+
+# CL_b, background only hypothesis
+mu = 0.0
+lr_val, mu_hat = likelihood_ratio(mu)
+q0 = jnp.where(mu_hat <= mu, lr_val, 0.0)
+p0 = 1 - jsp.stats.norm.cdf(jnp.sqrt(q0))
+CLs = [pmu / p0 for pmu in pmu_vals]
+
+
+# plot results
+fig, ax = plt.subplots()
+ax.plot(mu_vals, pmu_vals, marker="o", ls="--")
+ax.axhline(0.05, color="k", ls=":", label=r"$\alpha = 0.05$")
+ax.set_ylim([0, 1])
+ax.set_xlabel(r"$\mu$")
+ax.set_ylabel(r"$p_\mu$")
+ax.legend()
+
+fig, ax = plt.subplots()
+ax.plot(mu_vals, CLs, marker="o", ls="--")
+ax.axhline(0.05, color="k", ls=":", label=r"$\alpha = 0.05$")
+ax.set_ylim([0, 1])
+ax.set_xlabel(r"$\mu$")
+ax.set_ylabel(r"$CL_s$")
+ax.legend()
