@@ -11,6 +11,21 @@ from jaxtyping import Array
 # from model import hists, model, observation
 import evermore as evm
 
+plt.rc("axes", grid=True)
+
+hists = {
+    "nominal": {
+        "signal": jnp.array([10.0]),
+        "bkg": jnp.array([50.0]),
+    },
+    "bkg_unc": jnp.array([7.0]),
+}
+observation = jnp.array([55.0])
+
+
+def fun_bkg_unc(parameter: evm.Parameter, hist: Array) -> Array:
+    return hist + parameter.value * hists["bkg_unc"]
+
 
 class PyHFExample(eqx.Module):
     mu: evm.Parameter
@@ -26,9 +41,9 @@ class PyHFExample(eqx.Module):
         expectations["signal"] = sig_mod(hists["nominal"]["signal"])
 
         # bkg process
-        bkg_mod = self.bkg_unc.morphing(
-            up_template=hists["shape_up"]["bkg"],
-            down_template=hists["shape_down"]["bkg"],
+        bkg_mod = evm.Modifier(
+            parameter=self.bkg_unc,
+            effect=evm.effect.Lambda(fun_bkg_unc, normalize_by="offset"),
         )
         expectations["bkg"] = bkg_mod(hists["nominal"]["bkg"])
 
@@ -36,19 +51,6 @@ class PyHFExample(eqx.Module):
 
 
 model = PyHFExample()
-hists = {
-    "nominal": {
-        "signal": jnp.array([10.0]),
-        "bkg": jnp.array([50.0]),
-    },
-    "shape_up": {
-        "bkg": jnp.array([57.0]),
-    },
-    "shape_down": {
-        "bkg": jnp.array([43.0]),
-    },
-}
-observation = jnp.array([55.0])
 
 
 # optimizer
@@ -75,7 +77,7 @@ def make_step(model, opt_state, events, observation, filter_spec):
     dynamic_model, static_model = eqx.partition(model, filter_spec)
     grads = eqx.filter_grad(loss)(dynamic_model, static_model, events, observation)
     updates, opt_state = optim.update(grads, opt_state)
-    # apply nuisance parameter and DNN weight updates
+    # apply parameter updates
     model = eqx.apply_updates(model, updates)
     return model, opt_state
 
@@ -111,36 +113,50 @@ def conditional_fit(mu_val: float, steps: int = 10_000) -> tuple[eqx.Module, tup
     return jax.lax.fori_loop(0, steps, fit, (model_fixed_mu, opt_state))
 
 
-def likelihood_ratio(mu_val: float = 0.0) -> tuple[float, Array]:
+def likelihood_ratio(
+    nll_unconditional: Array, mu_val: float = 0.0
+) -> tuple[float, Array]:
     """
     Likelihood ratio
     lambda (mu) = L(mu, theta_hat_hat) / L(mu_hat, theta_hat)
 
     return - 2 * ln(lambda ( 0 ))
     """
-    model_unconditional, _ = unconditional_fit()
-    model_conditional, _ = conditional_fit(mu_val=mu_val)
+    nll_conditional, _ = calculate_nll_conditional(mu_val)
+    # loss returns -ln(l), so the ratio is inverted
 
-    nll_conditional = loss(
-        *eqx.partition(
-            model_conditional, evm.parameter.value_filter_spec(model_conditional)
-        ),
-        hists,
-        observation,
-    )
-    nll_unconditional = loss(
+    return float(-2 * (nll_unconditional - nll_conditional))
+
+
+def calculate_nll_unconditional() -> tuple[float, float]:
+    model_unconditional, _ = unconditional_fit()
+    return loss(
         *eqx.partition(
             model_unconditional, evm.parameter.value_filter_spec(model_unconditional)
         ),
         hists,
         observation,
-    )
-
-    # loss returns -ln(l), so the ratio is inverted
-
-    return float(
-        -2 * (nll_unconditional - nll_conditional)
     ), model_unconditional.mu.value
+
+
+@jax.jit
+def calculate_nll_conditional(mu_val: float) -> tuple[float, float]:
+    model_conditional, _ = conditional_fit(mu_val=mu_val)
+    return loss(
+        *eqx.partition(
+            model_conditional, evm.parameter.value_filter_spec(model_conditional)
+        ),
+        hists,
+        observation,
+    ), model_conditional.mu.value
+
+
+def calculate_q0(mu_hat: float, likelihood_ratio: float) -> float:
+    return jnp.where(mu_hat >= 0, likelihood_ratio, 0.0)
+
+
+def calculate_qmu(mu_hat: float, mu: float, likelihood_ratio: float) -> float:
+    return jnp.where(mu_hat <= mu, likelihood_ratio, 0.0)
 
 
 """
@@ -148,8 +164,13 @@ q0 test statistic
 q0 = -2 * ln(lambda ( 0 )) if mu_hat >= 0
 q0 = 0 if mu_hat < 0
 """
-likelihood_ratio_value, mu_hat = likelihood_ratio()
-q0 = jnp.where(mu_hat >= 0, likelihood_ratio_value, 0.0)
+# get overall best fit and nll
+nll_unconditional, mu_hat = calculate_nll_unconditional()
+# likelihood ratio for best fit and mu=0
+likelihood_ratio_value = likelihood_ratio(nll_unconditional=nll_unconditional)
+q0 = calculate_q0(
+    mu_hat, likelihood_ratio_value
+)  # jnp.where(mu_hat >= 0, likelihood_ratio_value, 0.0)
 p0 = 1 - jsp.stats.norm.cdf(jnp.sqrt(q0))
 
 # https://github.com/scikit-hep/pyhf/blob/3d26434be836050e334190c212b1db1a6f7650c8/src/pyhf/infer/calculators.py#L170
@@ -157,29 +178,49 @@ p0_alt = jsp.stats.norm.cdf(-jnp.sqrt(q0))
 
 # q_mu for upper limit
 mu = 0.0
-qmu = jnp.where(mu_hat <= mu, likelihood_ratio_value, 0.0)
+qmu = calculate_qmu(
+    mu_hat, mu, likelihood_ratio_value
+)  # jnp.where(mu_hat <= mu, likelihood_ratio_value, 0.0)
 pmu = 1 - jsp.stats.norm.cdf(jnp.sqrt(qmu))
 
 # CL_s+b
-mu_vals = jnp.arange(0, 5, 0.2)
+asimov_mu = 0.0
+asimov_lr = likelihood_ratio(nll_unconditional=nll_unconditional, mu_val=asimov_mu)
+q_asimov = calculate_qmu(mu_hat, asimov_mu, asimov_lr)
+mu_vals = jnp.arange(0, 5, 0.1)
+qmu_vals = []
 pmu_vals = []
 for mu in mu_vals:
-    lr_val, mu_hat = likelihood_ratio(mu)
-    qmu = jnp.where(mu_hat <= mu, lr_val, 0.0)
+    lr_val = likelihood_ratio(nll_unconditional=nll_unconditional, mu_val=mu)
+    # qmu = jnp.where(mu_hat <= mu, lr_val, 0.0)
+    # qmu = calculate_qmu(mu_hat, mu, lr_val)
+    qmu = calculate_q0(mu_hat, lr_val)
+    qmu_vals.append(qmu)
     pmu_vals.append(1 - jsp.stats.norm.cdf(jnp.sqrt(qmu)))
 
 # CL_b, background only hypothesis
 mu = 0.0
-lr_val, mu_hat = likelihood_ratio(mu)
-q0 = jnp.where(mu_hat <= mu, lr_val, 0.0)
-p0 = 1 - jsp.stats.norm.cdf(jnp.sqrt(q0))
-CLs = [pmu / p0 for pmu in pmu_vals]
+lr_val = likelihood_ratio(nll_unconditional=nll_unconditional, mu_val=mu)
+# qb = jnp.where(mu_hat <= mu, lr_val, 0.0)
+q_b = calculate_qmu(mu_hat, mu, lr_val)
+p_b = 1 - jsp.stats.norm.cdf(jnp.sqrt(q_b))
+CLs = [pmu / p_b for pmu in pmu_vals]
 
 
 # plot results
+
+fig, ax = plt.subplots()
+ax.plot(mu_vals, qmu_vals, marker="o", ls="--")
+ax.axvline(mu_hat, color="r", ls="--", label=r"$\hat{\mu}$")
+ax.set_xlabel(r"$\mu$")
+ax.set_ylabel(r"$q_\mu$")
+ax.set_yscale("log")
+ax.legend()
+
 fig, ax = plt.subplots()
 ax.plot(mu_vals, pmu_vals, marker="o", ls="--")
 ax.axhline(0.05, color="k", ls=":", label=r"$\alpha = 0.05$")
+ax.axvline(mu_hat, color="r", ls="--", label=r"$\hat{\mu}$")
 ax.set_ylim([0, 1])
 ax.set_xlabel(r"$\mu$")
 ax.set_ylabel(r"$p_\mu$")
@@ -188,6 +229,7 @@ ax.legend()
 fig, ax = plt.subplots()
 ax.plot(mu_vals, CLs, marker="o", ls="--")
 ax.axhline(0.05, color="k", ls=":", label=r"$\alpha = 0.05$")
+ax.axvline(mu_hat, color="r", ls="--", label=r"$\hat{\mu}$")
 ax.set_ylim([0, 1])
 ax.set_xlabel(r"$\mu$")
 ax.set_ylabel(r"$CL_s$")
